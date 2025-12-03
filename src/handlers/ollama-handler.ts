@@ -80,7 +80,7 @@ export class OllamaCloudHandler implements ModelHandler {
     logStructured(`OllamaCloud Request`, { targetModel: target, originalModel: claudePayload.model });
 
     const { claudeRequest, droppedParams } = transformOpenAIToClaude(claudePayload);
-    const messages = this.convertMessages(claudeRequest, target);
+    const messages = this.convertMessages(claudeRequest);
 
     // OllamaCloud no soporta tools en formato /api/chat
     // Mostrar warning si se intentan usar tools
@@ -122,10 +122,20 @@ export class OllamaCloudHandler implements ModelHandler {
     return this.handleStreamingResponse(c, response, adapter, target, claudeRequest);
   }
 
-  private convertMessages(req: any, modelId: string): any[] {
+  private convertMessages(req: any): any[] {
     const messages: any[] = [];
     if (req.system) {
-      let content = Array.isArray(req.system) ? req.system.map((i: any) => i.text || i).join("\n\n") : req.system;
+      let content: string;
+      if (Array.isArray(req.system)) {
+        content = req.system.map((i: any) => {
+          if (typeof i === "string") return i;
+          if (i?.text) return i.text;
+          if (i?.content) return typeof i.content === "string" ? i.content : JSON.stringify(i.content);
+          return JSON.stringify(i);
+        }).filter(Boolean).join("\n\n");
+      } else {
+        content = typeof req.system === "string" ? req.system : JSON.stringify(req.system);
+      }
       content = this.filterIdentity(content);
       messages.push({ role: "system", content });
     }
@@ -141,45 +151,46 @@ export class OllamaCloudHandler implements ModelHandler {
 
   private processUserMessage(msg: any, messages: any[]) {
     if (Array.isArray(msg.content)) {
-      const contentParts = [];
-      const toolResults = [];
-      const seen = new Set();
+      const textParts: string[] = [];
       for (const block of msg.content) {
-        if (block.type === "text") contentParts.push({ type: "text", text: block.text });
-        else if (block.type === "image") contentParts.push({ type: "image_url", image_url: { url: `data:${block.source.media_type};base64,${block.source.data}` } });
-        else if (block.type === "tool_result") {
-          if (seen.has(block.tool_use_id)) continue;
-          seen.add(block.tool_use_id);
-          toolResults.push({ role: "tool", content: typeof block.content === "string" ? block.content : JSON.stringify(block.content), tool_call_id: block.tool_use_id });
+        if (block.type === "text") {
+          textParts.push(block.text || "");
+        } else if (block.type === "image") {
+          // OllamaCloud doesn't support images in /api/chat, skip or add note
+          textParts.push("[Image not supported by OllamaCloud]");
         }
+        // Tool results are not supported by OllamaCloud, skip them
       }
-      if (toolResults.length) messages.push(...toolResults);
-      if (contentParts.length) messages.push({ role: "user", content: contentParts });
+      // OllamaCloud expects content as a string, not an array
+      const contentString = textParts.filter(Boolean).join("\n\n");
+      if (contentString) {
+        messages.push({ role: "user", content: contentString });
+      }
     } else {
-      messages.push({ role: "user", content: msg.content });
+      // Ensure content is a string
+      const contentString = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+      messages.push({ role: "user", content: contentString });
     }
   }
 
   private processAssistantMessage(msg: any, messages: any[]) {
     if (Array.isArray(msg.content)) {
-      const strings = [];
-      const toolCalls = [];
-      const seen = new Set();
+      const strings: string[] = [];
       for (const block of msg.content) {
-        if (block.type === "text") strings.push(block.text);
-        else if (block.type === "tool_use") {
-          if (seen.has(block.id)) continue;
-          seen.add(block.id);
-          toolCalls.push({ id: block.id, type: "function", function: { name: block.name, arguments: JSON.stringify(block.input) } });
+        if (block.type === "text") {
+          strings.push(block.text || "");
         }
+        // Tool calls are not supported by OllamaCloud, skip them
       }
-      const m: any = { role: "assistant" };
-      if (strings.length) m.content = strings.join(" ");
-      else if (toolCalls.length) m.content = null;
-      if (toolCalls.length) m.tool_calls = toolCalls;
-      if (m.content !== undefined || m.tool_calls) messages.push(m);
+      // OllamaCloud expects content as a string, not an array
+      const contentString = strings.filter(Boolean).join(" ");
+      if (contentString) {
+        messages.push({ role: "assistant", content: contentString });
+      }
     } else {
-      messages.push({ role: "assistant", content: msg.content });
+      // Ensure content is a string
+      const contentString = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+      messages.push({ role: "assistant", content: contentString });
     }
   }
 
@@ -340,4 +351,5 @@ export class OllamaCloudHandler implements ModelHandler {
 
   async shutdown() {}
 }
+
 
