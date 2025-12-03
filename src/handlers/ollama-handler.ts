@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ModelHandler } from "./types.js";
 import { AdapterManager } from "../adapters/adapter-manager.js";
+import type { ToolCall } from "../adapters/base-adapter.js";
 import { MiddlewareManager } from "../middleware/index.js";
 import { transformOpenAIToClaude } from "../transform.js";
 import { log, logStructured } from "../logger.js";
@@ -20,7 +21,6 @@ export class OllamaCloudHandler implements ModelHandler {
   private adapterManager: AdapterManager;
   private middlewareManager: MiddlewareManager;
   private port: number;
-  private CLAUDE_INTERNAL_CONTEXT_MAX = 200000;
 
   constructor(targetModel: string, apiKey: string | undefined, port: number) {
     this.targetModel = this.normalizeModelName(targetModel);
@@ -80,12 +80,11 @@ export class OllamaCloudHandler implements ModelHandler {
     logStructured(`OllamaCloud Request`, { targetModel: target, originalModel: claudePayload.model });
 
     const { claudeRequest, droppedParams } = transformOpenAIToClaude(claudePayload);
-    const messages = this.convertMessages(claudeRequest);
+    const messages = this.convertMessages(claudeRequest, claudeRequest.tools);
 
-    // OllamaCloud no soporta tools en formato /api/chat
-    // Mostrar warning si se intentan usar tools
+    // OllamaCloud no soporta tools nativamente, pero detectamos tool calls en formato JSON y los ejecutamos
     if (claudeRequest.tools && claudeRequest.tools.length > 0) {
-      log(`[OllamaCloud] Warning: Tools not supported by OllamaCloud, ignoring ${claudeRequest.tools.length} tool(s)`);
+      log(`[OllamaCloud] Tools context: ${claudeRequest.tools.length} tool(s) documented. Tool execution via JSON parsing is enabled - OllamaCloud should generate tool calls in JSON format.`);
     }
 
     // Transformar a formato Ollama
@@ -119,10 +118,10 @@ export class OllamaCloudHandler implements ModelHandler {
     const adapter = this.adapterManager.getAdapter();
     if (typeof adapter.reset === 'function') adapter.reset();
 
-    return this.handleStreamingResponse(c, response, adapter, target, claudeRequest);
+    return this.handleStreamingResponse(c, response, adapter, target);
   }
 
-  private convertMessages(req: any): any[] {
+  private convertMessages(req: any, availableTools?: any[]): any[] {
     const messages: any[] = [];
     if (req.system) {
       let content: string;
@@ -137,6 +136,14 @@ export class OllamaCloudHandler implements ModelHandler {
         content = typeof req.system === "string" ? req.system : JSON.stringify(req.system);
       }
       content = this.filterIdentity(content);
+      
+      // Si hay herramientas disponibles, agregarlas al contexto del sistema
+      // con instrucciones para generar tool calls en formato estructurado
+      if (availableTools && availableTools.length > 0) {
+        const toolsDescription = this.formatToolsForContext(availableTools);
+        content += `\n\n## Available Tools (Hybrid Execution via Proxy)\n\n${toolsDescription}\n\n**Important**: When you need to use tools, generate them in the JSON format specified above. The proxy will automatically execute them and provide results in the next message.`;
+      }
+      
       messages.push({ role: "system", content });
     }
 
@@ -194,6 +201,67 @@ export class OllamaCloudHandler implements ModelHandler {
     }
   }
 
+  private formatToolsForContext(tools: any[]): string {
+    const toolList = tools.slice(0, 30).map((tool: any, idx: number) => {
+      const name = tool.name || "unknown";
+      const desc = tool.description || "No description";
+      const params = tool.input_schema ? JSON.stringify(tool.input_schema.properties || {}, null, 2) : "{}";
+      const required = tool.input_schema?.required || [];
+      return `${idx + 1}. **${name}**: ${desc}\n   Parameters: ${params}\n   Required: ${JSON.stringify(required)}`;
+    }).join("\n\n");
+    
+    const more = tools.length > 30 ? `\n\n... and ${tools.length - 30} more tools available.` : "";
+    
+    // Instrucciones para generar tool calls en formato JSON estructurado
+    const toolCallInstructions = `
+
+## TOOL CALLING FORMAT (CRITICAL - READ CAREFULLY)
+
+When you need to use a tool, you MUST generate it in this EXACT JSON format. Use ONLY one of these two formats:
+
+**Format 1: JSON code block (RECOMMENDED)**
+Place a complete JSON code block with three backticks before and after:
+
+\`\`\`json
+{"tool_call": {"name": "ToolName", "input": {"param1": "value1", "param2": "value2"}}}
+\`\`\`
+
+**Format 2: Standalone JSON (ALTERNATIVE)**
+Place just the JSON object without code blocks:
+
+{"tool_call": {"name": "ToolName", "input": {"param1": "value1", "param2": "value2"}}}
+
+**Example for Read tool (code block format):**
+\`\`\`json
+{"tool_call": {"name": "Read", "input": {"file_path": "/path/to/file.txt"}}}
+\`\`\`
+
+**Example for Bash tool (standalone format):**
+{"tool_call": {"name": "Bash", "input": {"command": "ls -la", "description": "List files"}}}
+
+**CRITICAL RULES:**
+1. The JSON object MUST start with \`{"tool_call":\` and end with \`}\`
+2. If using code blocks, put \`\`\`json\` on its own line BEFORE the JSON, and \`\`\`\` on its own line AFTER
+3. Use EXACT tool names from the list above (case-sensitive)
+4. Include ALL required parameters from the Required array
+5. Place the JSON tool_call block AFTER your explanation text
+6. You can use multiple tools - place each in its own JSON block
+7. The tool_call JSON block will be automatically executed by the proxy
+
+**Common Mistakes to AVOID:**
+- ❌ DO NOT mix formats like: \`{"tool_call": ...\`\`\`json\` (wrong!)
+- ❌ DO NOT write: "I'll use the Read tool" - just use the JSON format
+- ❌ DO NOT make up parameter names - use exactly what's in the Parameters list
+- ❌ DO NOT skip required parameters
+
+**Correct Flow:**
+1. Explain what you're doing in natural language FIRST
+2. Then include the complete JSON tool_call block (using Format 1 or Format 2 above)
+3. Wait for tool results before continuing`;
+    
+    return toolList + more + toolCallInstructions;
+  }
+
   private filterIdentity(content: string): string {
     return content
       .replace(/You are Claude Code, Anthropic's official CLI/gi, "This is Claude Code, an AI-powered CLI tool")
@@ -204,7 +272,7 @@ export class OllamaCloudHandler implements ModelHandler {
   }
 
   // Transformar streaming Ollama (línea por línea) → SSE (formato OpenAI/Claude)
-  private handleStreamingResponse(c: Context, response: Response, adapter: any, target: string, request: any): Response {
+  private handleStreamingResponse(c: Context, response: Response, adapter: any, target: string): Response {
     let isClosed = false;
     let ping: NodeJS.Timeout | null = null;
     const encoder = new TextEncoder();
@@ -282,6 +350,8 @@ export class OllamaCloudHandler implements ModelHandler {
         try {
           const reader = response.body!.getReader();
           let buffer = "";
+          let accumulatedText = ""; // Para acumular texto completo y detectar tool calls al final
+          const allToolCalls: ToolCall[] = [];
 
           while (true) {
             const { done, value } = await reader.read();
@@ -301,6 +371,7 @@ export class OllamaCloudHandler implements ModelHandler {
                 // Transformar formato Ollama → OpenAI SSE
                 if (chunk.message?.content) {
                   lastActivity = Date.now();
+                  accumulatedText += chunk.message.content;
 
                   if (!textStarted) {
                     textIdx = curIdx++;
@@ -312,14 +383,21 @@ export class OllamaCloudHandler implements ModelHandler {
                     textStarted = true;
                   }
 
-                  // Procesar con adapter si está disponible
-                  const res = adapter.processTextContent ? adapter.processTextContent(chunk.message.content, "") : { cleanedText: chunk.message.content };
+                  // Procesar con adapter - el adapter maneja el buffering y parsing de tool calls
+                  const res = adapter.processTextContent(chunk.message.content, accumulatedText);
+                  
+                  // Enviar texto limpio (sin tool calls JSON)
                   if (res.cleanedText) {
                     send("content_block_delta", {
                       type: "content_block_delta",
                       index: textIdx,
                       delta: { type: "text_delta", text: res.cleanedText }
                     });
+                  }
+                  
+                  // Acumular tool calls detectados durante el streaming
+                  if (res.extractedToolCalls && res.extractedToolCalls.length > 0) {
+                    allToolCalls.push(...res.extractedToolCalls);
                   }
                 }
 
@@ -331,6 +409,72 @@ export class OllamaCloudHandler implements ModelHandler {
                   }
                   if (chunk.eval_count !== undefined) {
                     cumulativeOutputTokens += chunk.eval_count;
+                  }
+                  
+                  // Procesar texto final con adapter para detectar tool calls restantes
+                  const finalRes = adapter.processTextContent("", accumulatedText);
+                  if (finalRes.extractedToolCalls && finalRes.extractedToolCalls.length > 0) {
+                    allToolCalls.push(...finalRes.extractedToolCalls);
+                  }
+                  
+                  // Si hay tool calls, enviarlos como tool_use blocks
+                  if (allToolCalls.length > 0) {
+                    log(`[OllamaCloud] Detected ${allToolCalls.length} tool call(s) in response`);
+                    
+                    // Cerrar bloque de texto si está abierto
+                    if (textStarted) {
+                      send("content_block_stop", { type: "content_block_stop", index: textIdx });
+                      textStarted = false;
+                    }
+                    
+                    // Enviar cada tool call como tool_use block
+                    for (const toolCall of allToolCalls) {
+                      const toolIdx = curIdx++;
+                      send("content_block_start", {
+                        type: "content_block_start",
+                        index: toolIdx,
+                        content_block: {
+                          type: "tool_use",
+                          id: toolCall.id,
+                          name: toolCall.name,
+                          input: {}
+                        }
+                      });
+                      
+                      // Enviar input como JSON delta (incremental)
+                      const inputJson = JSON.stringify(toolCall.arguments);
+                      send("content_block_delta", {
+                        type: "content_block_delta",
+                        index: toolIdx,
+                        delta: { type: "input_json_delta", partial_json: inputJson }
+                      });
+                      
+                      send("content_block_stop", { type: "content_block_stop", index: toolIdx });
+                    }
+                    
+                    // Finalizar con tool_use stop reason
+                    await middlewareManager.afterStreamComplete(target, streamMetadata);
+                    send("message_delta", {
+                      type: "message_delta",
+                      delta: { stop_reason: "tool_use", stop_sequence: null },
+                      usage: { output_tokens: cumulativeOutputTokens || 1 }
+                    });
+                    send("message_stop", { type: "message_stop" });
+                    
+                    // Escribir archivo de tokens
+                    if (cumulativeInputTokens > 0 || cumulativeOutputTokens > 0) {
+                      handler.writeTokenFile(cumulativeInputTokens, cumulativeOutputTokens);
+                    }
+                    
+                    if (!isClosed) {
+                      try {
+                        controller.enqueue(encoder.encode('data: [DONE]\n\n\n'));
+                      } catch (e) {}
+                      controller.close();
+                      isClosed = true;
+                      if (ping) clearInterval(ping);
+                    }
+                    return;
                   }
                   
                   // Escribir archivo de tokens para la línea de estado

@@ -360,11 +360,17 @@ OllamaCloud models follow these naming patterns:
 - `model-name:tag-cloud` (e.g., `llama-3:70b-cloud`)
 - `model:tag` (without `/` and with `:cloud` suffix)
 
-**Limitations:**
+**⚠️ Important Limitations:**
 
-- Tool calling is not supported by OllamaCloud's `/api/chat` endpoint
-- If you use tools, they will be automatically ignored with a warning
+- ❌ **Tool calling is NOT supported** - OllamaCloud's `/api/chat` endpoint does not support function calling
+- ❌ **Tools will NOT work** - Tools like `write_to_file`, `bash`, `read`, etc. are silently ignored
+- ❌ **Files won't be created** - If the model says it used `write_to_file`, the file was NOT actually created
+- ❌ **Commands won't run** - If the model says it ran a command, it did NOT execute
+- ⚠️ **Use OpenRouter for tools** - If you need tool support, use OpenRouter provider instead
 - Cost tracking is not available (shows as N/A in status line)
+
+**Why this matters:**
+If you're using OllamaCloud and Claude Code tries to use tools, you'll see warnings but the tools will be silently ignored. The model may respond as if it used tools successfully, but nothing actually happened. For tasks requiring file operations or command execution, use OpenRouter models instead.
 
 List all available models:
 
@@ -1100,10 +1106,11 @@ If the status line doesn't show the model name:
 
 **When to use Claudish:**
 - ✅ Want to try different models (Grok, GPT-5, Ollama models, etc.)
-- ✅ Need OpenRouter-specific features
+- ✅ Need OpenRouter-specific features (including tool calling)
 - ✅ Prefer OpenRouter or OllamaCloud pricing
 - ✅ Testing model performance
-- ✅ Want to use  cloud-hosted Ollama models
+- ✅ Want to use cloud-hosted Ollama models (for tasks that don't require tools)
+- ⚠️ **Note:** Use OpenRouter provider if you need tool support (file operations, command execution, etc.)
 
 **When to use Claude Code:**
 - ✅ Want latest Anthropic models only
