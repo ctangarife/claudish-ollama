@@ -15,7 +15,7 @@ const path = isWindows ? pathWin32 : pathPosix;
  */
 function getSafeTempDir(): string {
   const systemTemp = tmpdir();
-  
+
   // On Windows, if system temp has spaces, try to use a path without spaces
   if (isWindows && systemTemp.includes(" ")) {
     // Try to use a temp directory in the current project
@@ -31,7 +31,7 @@ function getSafeTempDir(): string {
       // Fallback to system temp if project temp fails
     }
   }
-  
+
   return systemTemp;
 }
 
@@ -164,13 +164,13 @@ export async function runClaudeWithProxy(
   // Add settings file flag first (applies to this instance only)
   // Convert to absolute path using native path module
   let absoluteSettingsPath = path.resolve(tempSettingsPath);
-  
+
   // For Windows, ensure we use forward slashes in the path passed to Claude Code
   // Claude Code on Windows can handle both, but forward slashes are safer
   if (isWindows) {
     absoluteSettingsPath = absoluteSettingsPath.replace(/\\/g, "/");
   }
-  
+
   claudeArgs.push("--settings", absoluteSettingsPath);
 
   // Interactive mode - no automatic arguments
@@ -237,6 +237,19 @@ export async function runClaudeWithProxy(
     env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "sk-ant-api03-placeholder-not-used-proxy-handles-auth-with-openrouter-key-xxxxxxxxxxxxxxxxxxxxx";
   }
 
+  // Helper function to log messages (respects quiet flag)
+  const log = (message: string) => {
+    if (!config.quiet) {
+      console.log(message);
+    }
+  };
+
+  if (config.interactive) {
+    log(`\n[claudish] Model: ${modelId}\n`);
+  } else {
+    log(`\n[claudish] Model: ${modelId}`);
+    log(`[claudish] Arguments: ${claudeArgs.join(" ")}\n`);
+  }
 
   // Spawn claude CLI process using Node.js child_process (works on both Node.js and Bun)
   // Windows needs shell: true to find .cmd/.bat files like claude.cmd
