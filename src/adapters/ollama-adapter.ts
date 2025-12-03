@@ -16,6 +16,118 @@ export class OllamaAdapter extends BaseModelAdapter {
   private textBuffer: string = "";
   private sentTextLength: number = 0; // Track how much text we've already sent
 
+  /**
+   * Create a tool call with a unique ID
+   */
+  private createToolCall(name: string, arguments_: Record<string, any>): ToolCall {
+    return {
+      id: `toolu_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 11)}`,
+      name,
+      arguments: arguments_,
+    };
+  }
+
+  /**
+   * Extract JSON object boundaries by counting braces
+   */
+  private extractJsonBoundaries(text: string, startIndex: number): { start: number; end: number } | null {
+    let braceCount = 0;
+    let foundStart = false;
+
+    for (let i = startIndex; i < text.length; i++) {
+      if (text[i] === '{') {
+        braceCount++;
+        foundStart = true;
+      } else if (text[i] === '}') {
+        braceCount--;
+        if (foundStart && braceCount === 0) {
+          return { start: startIndex, end: i + 1 };
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Parse and validate a tool call from JSON text
+   */
+  private parseToolCall(jsonText: string, seenToolCalls: Set<string>): ToolCall | null {
+    try {
+      let cleanedJson = jsonText.trim();
+      
+      // Remove trailing markdown code block markers
+      cleanedJson = cleanedJson.replace(/```[a-z]*\s*$/g, '').trim();
+      
+      // Extract JSON if wrapped in extra characters
+      const jsonMatch = cleanedJson.match(/\{\s*"tool_call"\s*:[\s\S]*\}/);
+      if (jsonMatch) {
+        cleanedJson = jsonMatch[0];
+      }
+
+      const parsed = JSON.parse(cleanedJson);
+      if (parsed.tool_call?.name && parsed.tool_call?.input) {
+        const toolKey = `${parsed.tool_call.name}:${JSON.stringify(parsed.tool_call.input)}`;
+        if (!seenToolCalls.has(toolKey)) {
+          seenToolCalls.add(toolKey);
+          return this.createToolCall(parsed.tool_call.name, parsed.tool_call.input);
+        }
+      }
+    } catch (e) {
+      // Will try recovery methods
+    }
+    return null;
+  }
+
+  /**
+   * Attempt to recover tool call from malformed JSON
+   */
+  private recoverToolCall(jsonText: string, seenToolCalls: Set<string>): ToolCall | null {
+    // Method 1: Extract by JSON boundaries
+    const jsonStart = jsonText.indexOf('{"tool_call"');
+    if (jsonStart >= 0) {
+      const boundaries = this.extractJsonBoundaries(jsonText, jsonStart);
+      if (boundaries) {
+        try {
+          const extractedJson = jsonText.slice(boundaries.start, boundaries.end);
+          const parsed = JSON.parse(extractedJson);
+          if (parsed.tool_call?.name && parsed.tool_call?.input) {
+            const toolKey = `${parsed.tool_call.name}:${JSON.stringify(parsed.tool_call.input)}`;
+            if (!seenToolCalls.has(toolKey)) {
+              seenToolCalls.add(toolKey);
+              return this.createToolCall(parsed.tool_call.name, parsed.tool_call.input);
+            }
+          }
+        } catch (e) {
+          // Continue to next recovery method
+        }
+      }
+    }
+
+    // Method 2: Extract by name and input patterns
+    const nameMatch = jsonText.match(/"name"\s*:\s*"([^"]+)"/);
+    if (nameMatch) {
+      const toolName = nameMatch[1];
+      const inputPattern = /"input"\s*:\s*\{([^}]+(?:\{[^}]*\}[^}]*)*)\}/;
+      const inputMatch = jsonText.match(inputPattern);
+      
+      if (inputMatch) {
+        try {
+          const inputJson = `{${inputMatch[1]}}`;
+          const parsedInput = JSON.parse(inputJson);
+          const toolKey = `${toolName}:${JSON.stringify(parsedInput)}`;
+          if (!seenToolCalls.has(toolKey)) {
+            seenToolCalls.add(toolKey);
+            return this.createToolCall(toolName, parsedInput);
+          }
+        } catch (e) {
+          // Recovery failed
+        }
+      }
+    }
+
+    return null;
+  }
+
   processTextContent(
     textContent: string,
     _accumulatedText: string
@@ -125,91 +237,33 @@ export class OllamaAdapter extends BaseModelAdapter {
       };
     }
 
-    // Extract tool calls from JSON - try to fix common issues first
+    // Extract tool calls from JSON matches
     const toolCalls: ToolCall[] = [];
     const seenToolCalls = new Set<string>(); // Avoid duplicates
+    const matchesToRemove: string[] = []; // Collect match strings for removal
     
     for (const { match: matchText, json: jsonText } of allMatches) {
-      try {
-        // Try to clean up common formatting issues
-        let cleanedJson = jsonText.trim();
-        
-        // Remove any trailing markdown code block markers
-        cleanedJson = cleanedJson.replace(/```[a-z]*\s*$/g, '').trim();
-        
-        // Try to extract JSON if it's wrapped in extra characters
-        const jsonMatch = cleanedJson.match(/\{\s*"tool_call"\s*:[\s\S]*\}/);
-        if (jsonMatch) {
-          cleanedJson = jsonMatch[0];
-        }
-        
-        const parsed = JSON.parse(cleanedJson);
-        if (parsed.tool_call && parsed.tool_call.name && parsed.tool_call.input) {
-          const toolKey = `${parsed.tool_call.name}:${JSON.stringify(parsed.tool_call.input)}`;
-          if (seenToolCalls.has(toolKey)) {
-            continue; // Skip duplicates
-          }
-          seenToolCalls.add(toolKey);
-          
-          const toolCall: ToolCall = {
-            id: `ollama_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
-            name: parsed.tool_call.name,
-            arguments: parsed.tool_call.input,
-          };
-          toolCalls.push(toolCall);
-          log(`[OllamaAdapter] Detected tool call: ${toolCall.name} with params: ${JSON.stringify(toolCall.arguments)}`);
-        }
-      } catch (e) {
-        // Try to extract valid JSON from the malformed string
-        try {
-          // Look for JSON object boundaries
-          const jsonStart = jsonText.indexOf('{"tool_call"');
-          if (jsonStart >= 0) {
-            let braceCount = 0;
-            let jsonEnd = jsonStart;
-            let foundStart = false;
-            
-            for (let i = jsonStart; i < jsonText.length; i++) {
-              if (jsonText[i] === '{') {
-                braceCount++;
-                foundStart = true;
-              } else if (jsonText[i] === '}') {
-                braceCount--;
-                if (foundStart && braceCount === 0) {
-                  jsonEnd = i + 1;
-                  break;
-                }
-              }
-            }
-            
-            if (jsonEnd > jsonStart) {
-              const extractedJson = jsonText.slice(jsonStart, jsonEnd);
-              const parsed = JSON.parse(extractedJson);
-              if (parsed.tool_call && parsed.tool_call.name && parsed.tool_call.input) {
-                const toolKey = `${parsed.tool_call.name}:${JSON.stringify(parsed.tool_call.input)}`;
-                if (!seenToolCalls.has(toolKey)) {
-                  seenToolCalls.add(toolKey);
-                  const toolCall: ToolCall = {
-                    id: `ollama_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
-                    name: parsed.tool_call.name,
-                    arguments: parsed.tool_call.input,
-                  };
-                  toolCalls.push(toolCall);
-                  log(`[OllamaAdapter] Recovered tool call from malformed JSON: ${toolCall.name}`);
-                }
-              }
-            }
-          }
-        } catch (recoveryError) {
-          // Failed to recover, log and skip
-          log(`[OllamaAdapter] Failed to parse tool call JSON: ${jsonText.substring(0, 100)}... Error: ${e}`);
-        }
+      matchesToRemove.push(matchText); // Store for cleanup
+      
+      // Try normal parsing first
+      let toolCall = this.parseToolCall(jsonText, seenToolCalls);
+      
+      // If normal parsing failed, try recovery methods
+      if (!toolCall) {
+        toolCall = this.recoverToolCall(jsonText, seenToolCalls);
+      }
+      
+      if (toolCall) {
+        toolCalls.push(toolCall);
+        log(`[OllamaAdapter] Detected tool call: ${toolCall.name} with params: ${JSON.stringify(toolCall.arguments)}`);
+      } else {
+        log(`[OllamaAdapter] Failed to parse tool call JSON: ${jsonText.substring(0, 150)}...`);
       }
     }
 
     // Remove tool call JSON blocks from text
     let cleanedBuffer = this.textBuffer;
-    for (const { match: matchText } of allMatches) {
+    for (const matchText of matchesToRemove) {
       cleanedBuffer = cleanedBuffer.replace(matchText, '');
     }
 

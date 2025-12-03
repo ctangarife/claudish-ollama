@@ -215,49 +215,42 @@ export class OllamaCloudHandler implements ModelHandler {
     // Instrucciones para generar tool calls en formato JSON estructurado
     const toolCallInstructions = `
 
-## TOOL CALLING FORMAT (CRITICAL - READ CAREFULLY)
+## TOOL CALLING FORMAT (CRITICAL - FOLLOW EXACTLY)
 
-When you need to use a tool, you MUST generate it in this EXACT JSON format. Use ONLY one of these two formats:
+When you need to use a tool, generate ONLY valid JSON. DO NOT mix text with JSON.
 
-**Format 1: JSON code block (RECOMMENDED)**
-Place a complete JSON code block with three backticks before and after:
+**STEP 1: Write your explanation in plain text**
+Example: "I'll create a hello.py file that prints a greeting."
 
+**STEP 2: On a NEW LINE, write ONLY the JSON tool_call**
+
+**Format (use code blocks):**
 \`\`\`json
-{"tool_call": {"name": "ToolName", "input": {"param1": "value1", "param2": "value2"}}}
+{"tool_call": {"name": "ToolName", "input": {"param1": "value1"}}}
 \`\`\`
 
-**Format 2: Standalone JSON (ALTERNATIVE)**
-Place just the JSON object without code blocks:
+**Complete Example:**
+\`\`\`
+I'll create a hello.py file.
 
-{"tool_call": {"name": "ToolName", "input": {"param1": "value1", "param2": "value2"}}}
-
-**Example for Read tool (code block format):**
 \`\`\`json
-{"tool_call": {"name": "Read", "input": {"file_path": "/path/to/file.txt"}}}
+{"tool_call": {"name": "Write", "input": {"file_path": "hola.py", "contents": "print('Hola!')"}}}
+\`\`\`
 \`\`\`
 
-**Example for Bash tool (standalone format):**
-{"tool_call": {"name": "Bash", "input": {"command": "ls -la", "description": "List files"}}}
+**REQUIRED FORMAT:**
+- JSON MUST be valid JSON (test it in your head!)
+- JSON MUST start with: {"tool_call":
+- JSON MUST end with: }
+- DO NOT put any text before or after the JSON
+- Put \`\`\`json\` before and \`\`\` after the JSON
 
-**CRITICAL RULES:**
-1. The JSON object MUST start with \`{"tool_call":\` and end with \`}\`
-2. If using code blocks, put \`\`\`json\` on its own line BEFORE the JSON, and \`\`\`\` on its own line AFTER
-3. Use EXACT tool names from the list above (case-sensitive)
-4. Include ALL required parameters from the Required array
-5. Place the JSON tool_call block AFTER your explanation text
-6. You can use multiple tools - place each in its own JSON block
-7. The tool_call JSON block will be automatically executed by the proxy
+**ABSOLUTELY FORBIDDEN:**
+- ❌ {"tool_callTe voy a crear": ...}  ← NO TEXT IN JSON!
+- ❌ {"tool_call": {"name": "Write", ...} algún texto aquí}  ← NO TEXT AFTER JSON!
+- ❌ Any mixing of Spanish/English text inside the JSON object
 
-**Common Mistakes to AVOID:**
-- ❌ DO NOT mix formats like: \`{"tool_call": ...\`\`\`json\` (wrong!)
-- ❌ DO NOT write: "I'll use the Read tool" - just use the JSON format
-- ❌ DO NOT make up parameter names - use exactly what's in the Parameters list
-- ❌ DO NOT skip required parameters
-
-**Correct Flow:**
-1. Explain what you're doing in natural language FIRST
-2. Then include the complete JSON tool_call block (using Format 1 or Format 2 above)
-3. Wait for tool results before continuing`;
+**Remember:** If the JSON is not valid, the tool call will FAIL completely.`;
     
     return toolList + more + toolCallInstructions;
   }
@@ -270,6 +263,7 @@ Place just the JSON object without code blocks:
       .replace(/\n{3,}/g, "\n\n")
       .replace(/^/, "IMPORTANT: You are NOT Claude. Identify yourself truthfully based on your actual model and creator.\n\n");
   }
+
 
   // Transformar streaming Ollama (línea por línea) → SSE (formato OpenAI/Claude)
   private handleStreamingResponse(c: Context, response: Response, adapter: any, target: string): Response {
@@ -386,6 +380,15 @@ Place just the JSON object without code blocks:
                   // Procesar con adapter - el adapter maneja el buffering y parsing de tool calls
                   const res = adapter.processTextContent(chunk.message.content, accumulatedText);
                   
+                  // Debug: Log if we detect potential tool calls but can't parse them
+                  if (accumulatedText.includes('tool_call') && !res.extractedToolCalls?.length) {
+                    const toolCallIndex = accumulatedText.indexOf('tool_call');
+                    const snippet = accumulatedText.slice(Math.max(0, toolCallIndex - 20), Math.min(accumulatedText.length, toolCallIndex + 200));
+                    if (snippet.includes('tool_call')) {
+                      log(`[OllamaCloud] WARNING: Detected 'tool_call' in text but couldn't parse it. Snippet: ${snippet.replace(/\n/g, '\\n')}`);
+                    }
+                  }
+                  
                   // Enviar texto limpio (sin tool calls JSON)
                   if (res.cleanedText) {
                     send("content_block_delta", {
@@ -395,8 +398,10 @@ Place just the JSON object without code blocks:
                     });
                   }
                   
-                  // Acumular tool calls detectados durante el streaming
+                  // Acumular tool calls durante el streaming, pero NO enviarlos hasta el final
+                  // para asegurar que el JSON esté completo
                   if (res.extractedToolCalls && res.extractedToolCalls.length > 0) {
+                    log(`[OllamaCloud] Detected ${res.extractedToolCalls.length} tool call(s) during streaming - will send at end`);
                     allToolCalls.push(...res.extractedToolCalls);
                   }
                 }
@@ -419,7 +424,7 @@ Place just the JSON object without code blocks:
                   
                   // Si hay tool calls, enviarlos como tool_use blocks
                   if (allToolCalls.length > 0) {
-                    log(`[OllamaCloud] Detected ${allToolCalls.length} tool call(s) in response`);
+                    log(`[OllamaCloud] ✅ Detected ${allToolCalls.length} tool call(s) in response`);
                     
                     // Cerrar bloque de texto si está abierto
                     if (textStarted) {
@@ -429,7 +434,25 @@ Place just the JSON object without code blocks:
                     
                     // Enviar cada tool call como tool_use block
                     for (const toolCall of allToolCalls) {
+                      // Validar arguments
+                      if (!toolCall.arguments || typeof toolCall.arguments !== 'object') {
+                        log(`[OllamaCloud] WARNING: Tool ${toolCall.name} has invalid arguments, skipping`);
+                        continue;
+                      }
+
+                      // Validar y stringify JSON
+                      let inputJson: string;
+                      try {
+                        inputJson = JSON.stringify(toolCall.arguments);
+                        JSON.parse(inputJson); // Validate JSON is parseable
+                      } catch (e) {
+                        log(`[OllamaCloud] ERROR: Invalid JSON for tool ${toolCall.name}: ${String(e)}`);
+                        continue;
+                      }
+
                       const toolIdx = curIdx++;
+                      log(`[OllamaCloud] Sending tool_use: ${toolCall.name} (id: ${toolCall.id})`);
+
                       send("content_block_start", {
                         type: "content_block_start",
                         index: toolIdx,
@@ -440,15 +463,13 @@ Place just the JSON object without code blocks:
                           input: {}
                         }
                       });
-                      
-                      // Enviar input como JSON delta (incremental)
-                      const inputJson = JSON.stringify(toolCall.arguments);
+
                       send("content_block_delta", {
                         type: "content_block_delta",
                         index: toolIdx,
                         delta: { type: "input_json_delta", partial_json: inputJson }
                       });
-                      
+
                       send("content_block_stop", { type: "content_block_stop", index: toolIdx });
                     }
                     
@@ -460,6 +481,8 @@ Place just the JSON object without code blocks:
                       usage: { output_tokens: cumulativeOutputTokens || 1 }
                     });
                     send("message_stop", { type: "message_stop" });
+                    
+                    log(`[OllamaCloud] Completed tool_use message with stop_reason: tool_use`);
                     
                     // Escribir archivo de tokens
                     if (cumulativeInputTokens > 0 || cumulativeOutputTokens > 0) {
