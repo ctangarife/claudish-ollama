@@ -31,9 +31,9 @@ export class OllamaCloudHandler implements ModelHandler {
     this.middlewareManager.initialize().catch(err => log(`[Handler:${this.targetModel}] Middleware init error: ${err}`));
   }
 
-  // Normalizar nombre de modelo (adaptado de ollama-client-lib)
+  // Normalize model name (adapted from ollama-client-lib)
   private normalizeModelName(model: string): string {
-    // OllamaCloud maneja -cloud internamente, pero lo mantenemos por consistencia
+    // OllamaCloud handles -cloud internally, but we keep it for consistency
     if (!model.endsWith("-cloud") && !model.includes(":cloud")) {
       if (model.includes(":")) {
         const [base, version] = model.split(":");
@@ -44,7 +44,7 @@ export class OllamaCloudHandler implements ModelHandler {
     return model;
   }
 
-  // Transformar petición OpenAI → Ollama
+  // Transform OpenAI request → Ollama
   private transformToOllamaFormat(openAIPayload: any): any {
     return {
       model: this.normalizeModelName(openAIPayload.model),
@@ -82,12 +82,12 @@ export class OllamaCloudHandler implements ModelHandler {
     const { claudeRequest, droppedParams } = transformOpenAIToClaude(claudePayload);
     const messages = this.convertMessages(claudeRequest, claudeRequest.tools);
 
-    // OllamaCloud no soporta tools nativamente, pero detectamos tool calls en formato JSON y los ejecutamos
+    // OllamaCloud doesn't natively support tools, but we detect tool calls in JSON format and execute them
     if (claudeRequest.tools && claudeRequest.tools.length > 0) {
       log(`[OllamaCloud] Tools context: ${claudeRequest.tools.length} tool(s) documented. Tool execution via JSON parsing is enabled - OllamaCloud should generate tool calls in JSON format.`);
     }
 
-    // Transformar a formato Ollama
+    // Transform to Ollama format
     const ollamaPayload = this.transformToOllamaFormat({
       model: target,
       messages: messages,
@@ -137,8 +137,8 @@ export class OllamaCloudHandler implements ModelHandler {
       }
       content = this.filterIdentity(content);
       
-      // Si hay herramientas disponibles, agregarlas al contexto del sistema
-      // con instrucciones para generar tool calls en formato estructurado
+      // If tools are available, add them to the system context
+      // with instructions to generate tool calls in structured format
       if (availableTools && availableTools.length > 0) {
         const toolsDescription = this.formatToolsForContext(availableTools);
         content += `\n\n## Available Tools (Hybrid Execution via Proxy)\n\n${toolsDescription}\n\n**Important**: When you need to use tools, generate them in the JSON format specified above. The proxy will automatically execute them and provide results in the next message.`;
@@ -212,7 +212,7 @@ export class OllamaCloudHandler implements ModelHandler {
     
     const more = tools.length > 30 ? `\n\n... and ${tools.length - 30} more tools available.` : "";
     
-    // Instrucciones para generar tool calls en formato JSON estructurado
+    // Instructions to generate tool calls in structured JSON format
     const toolCallInstructions = `
 
 ## TOOL CALLING FORMAT (CRITICAL - FOLLOW EXACTLY)
@@ -246,8 +246,8 @@ I'll create a hello.py file.
 - Put \`\`\`json\` before and \`\`\` after the JSON
 
 **ABSOLUTELY FORBIDDEN:**
-- ❌ {"tool_callTe voy a crear": ...}  ← NO TEXT IN JSON!
-- ❌ {"tool_call": {"name": "Write", ...} algún texto aquí}  ← NO TEXT AFTER JSON!
+- ❌ {"tool_callI going to create": ...}  ← NO TEXT IN JSON!
+- ❌ {"tool_call": {"name": "Write", ...} some text here}  ← NO TEXT AFTER JSON!
 - ❌ Any mixing of Spanish/English text inside the JSON object
 
 **Remember:** If the JSON is not valid, the tool call will FAIL completely.`;
@@ -265,7 +265,7 @@ I'll create a hello.py file.
   }
 
 
-  // Transformar streaming Ollama (línea por línea) → SSE (formato OpenAI/Claude)
+  // Transform streaming Ollama (line by line) → SSE (OpenAI/Claude format)
   private handleStreamingResponse(c: Context, response: Response, adapter: any, target: string): Response {
     let isClosed = false;
     let ping: NodeJS.Timeout | null = null;
@@ -274,7 +274,7 @@ I'll create a hello.py file.
 
     const middlewareManager = this.middlewareManager;
     const streamMetadata = new Map<string, any>();
-    const handler = this; // Capturar referencia para usar en closure
+    const handler = this; // Capture reference for use in closure
 
     return c.body(new ReadableStream({
       async start(controller) {
@@ -344,7 +344,7 @@ I'll create a hello.py file.
         try {
           const reader = response.body!.getReader();
           let buffer = "";
-          let accumulatedText = ""; // Para acumular texto completo y detectar tool calls al final
+          let accumulatedText = ""; // Accumulate full text to detect tool calls at the end
           const allToolCalls: ToolCall[] = [];
 
           while (true) {
@@ -359,10 +359,10 @@ I'll create a hello.py file.
               if (!line.trim()) continue;
 
               try {
-                // Ollama devuelve JSON línea por línea (no SSE)
+                // Ollama returns JSON line by line (not SSE)
                 const chunk = JSON.parse(line);
 
-                // Transformar formato Ollama → OpenAI SSE
+                // Transform Ollama format → OpenAI SSE
                 if (chunk.message?.content) {
                   lastActivity = Date.now();
                   accumulatedText += chunk.message.content;
@@ -377,7 +377,7 @@ I'll create a hello.py file.
                     textStarted = true;
                   }
 
-                  // Procesar con adapter - el adapter maneja el buffering y parsing de tool calls
+                  // Process with adapter - the adapter handles buffering and parsing of tool calls
                   const res = adapter.processTextContent(chunk.message.content, accumulatedText);
                   
                   // Debug: Log if we detect potential tool calls but can't parse them
@@ -389,7 +389,7 @@ I'll create a hello.py file.
                     }
                   }
                   
-                  // Enviar texto limpio (sin tool calls JSON)
+                  // Send clean text (without tool calls JSON)
                   if (res.cleanedText) {
                     send("content_block_delta", {
                       type: "content_block_delta",
@@ -398,17 +398,17 @@ I'll create a hello.py file.
                     });
                   }
                   
-                  // Acumular tool calls durante el streaming, pero NO enviarlos hasta el final
-                  // para asegurar que el JSON esté completo
+                  // Accumulate tool calls during streaming, but DO NOT send them until the end
+                  // to ensure the JSON is complete
                   if (res.extractedToolCalls && res.extractedToolCalls.length > 0) {
                     log(`[OllamaCloud] Detected ${res.extractedToolCalls.length} tool call(s) during streaming - will send at end`);
                     allToolCalls.push(...res.extractedToolCalls);
                   }
                 }
 
-                // Ollama marca done cuando termina y puede incluir información de tokens
+                // Ollama marks done when finished and may include token information
                 if (chunk.done) {
-                  // OllamaCloud puede devolver tokens en la respuesta final
+                  // OllamaCloud may return tokens in the final response
                   if (chunk.prompt_eval_count !== undefined) {
                     cumulativeInputTokens += chunk.prompt_eval_count;
                   }
@@ -416,31 +416,31 @@ I'll create a hello.py file.
                     cumulativeOutputTokens += chunk.eval_count;
                   }
                   
-                  // Procesar texto final con adapter para detectar tool calls restantes
+                  // Process final text with adapter to detect remaining tool calls
                   const finalRes = adapter.processTextContent("", accumulatedText);
                   if (finalRes.extractedToolCalls && finalRes.extractedToolCalls.length > 0) {
                     allToolCalls.push(...finalRes.extractedToolCalls);
                   }
                   
-                  // Si hay tool calls, enviarlos como tool_use blocks
+                  // If there are tool calls, send them as tool_use blocks
                   if (allToolCalls.length > 0) {
                     log(`[OllamaCloud] ✅ Detected ${allToolCalls.length} tool call(s) in response`);
                     
-                    // Cerrar bloque de texto si está abierto
+                    // Close text block if open
                     if (textStarted) {
                       send("content_block_stop", { type: "content_block_stop", index: textIdx });
                       textStarted = false;
                     }
                     
-                    // Enviar cada tool call como tool_use block
+                    // Send each tool call as tool_use block
                     for (const toolCall of allToolCalls) {
-                      // Validar arguments
+                      // Validate arguments
                       if (!toolCall.arguments || typeof toolCall.arguments !== 'object') {
                         log(`[OllamaCloud] WARNING: Tool ${toolCall.name} has invalid arguments, skipping`);
                         continue;
                       }
 
-                      // Validar y stringify JSON
+                      // Validate and stringify JSON
                       let inputJson: string;
                       try {
                         inputJson = JSON.stringify(toolCall.arguments);
@@ -473,7 +473,7 @@ I'll create a hello.py file.
                       send("content_block_stop", { type: "content_block_stop", index: toolIdx });
                     }
                     
-                    // Finalizar con tool_use stop reason
+                    // Finalize with tool_use stop reason
                     await middlewareManager.afterStreamComplete(target, streamMetadata);
                     send("message_delta", {
                       type: "message_delta",
@@ -484,7 +484,7 @@ I'll create a hello.py file.
                     
                     log(`[OllamaCloud] Completed tool_use message with stop_reason: tool_use`);
                     
-                    // Escribir archivo de tokens
+                    // Write token file
                     if (cumulativeInputTokens > 0 || cumulativeOutputTokens > 0) {
                       handler.writeTokenFile(cumulativeInputTokens, cumulativeOutputTokens);
                     }
@@ -500,7 +500,7 @@ I'll create a hello.py file.
                     return;
                   }
                   
-                  // Escribir archivo de tokens para la línea de estado
+                  // Write token file for status line
                   if (cumulativeInputTokens > 0 || cumulativeOutputTokens > 0) {
                     handler.writeTokenFile(cumulativeInputTokens, cumulativeOutputTokens);
                   }
@@ -509,7 +509,7 @@ I'll create a hello.py file.
                   return;
                 }
               } catch (e) {
-                // Ignorar líneas inválidas
+                // Ignore invalid lines
               }
             }
           }
