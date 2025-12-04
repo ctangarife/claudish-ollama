@@ -123,28 +123,40 @@ export class OllamaCloudHandler implements ModelHandler {
 
   private convertMessages(req: any, availableTools?: any[]): any[] {
     const messages: any[] = [];
+    let systemContent: string = "";
+    
     if (req.system) {
-      let content: string;
       if (Array.isArray(req.system)) {
-        content = req.system.map((i: any) => {
+        systemContent = req.system.map((i: any) => {
           if (typeof i === "string") return i;
           if (i?.text) return i.text;
           if (i?.content) return typeof i.content === "string" ? i.content : JSON.stringify(i.content);
           return JSON.stringify(i);
         }).filter(Boolean).join("\n\n");
       } else {
-        content = typeof req.system === "string" ? req.system : JSON.stringify(req.system);
+        systemContent = typeof req.system === "string" ? req.system : JSON.stringify(req.system);
       }
-      content = this.filterIdentity(content);
+      systemContent = this.filterIdentity(systemContent);
+    }
+    
+    // If tools are available, add them to the system context
+    // with instructions to generate tool calls in structured format
+    // (Bug 2 fix: Always add tool instructions, even if no system prompt exists)
+    if (availableTools && availableTools.length > 0) {
+      const toolsDescription = this.formatToolsForContext(availableTools);
+      const toolInstructions = `## Available Tools (Hybrid Execution via Proxy)\n\n${toolsDescription}\n\n**Important**: When you need to use tools, generate them in the JSON format specified above. The proxy will automatically execute them and provide results in the next message.`;
       
-      // If tools are available, add them to the system context
-      // with instructions to generate tool calls in structured format
-      if (availableTools && availableTools.length > 0) {
-        const toolsDescription = this.formatToolsForContext(availableTools);
-        content += `\n\n## Available Tools (Hybrid Execution via Proxy)\n\n${toolsDescription}\n\n**Important**: When you need to use tools, generate them in the JSON format specified above. The proxy will automatically execute them and provide results in the next message.`;
+      if (systemContent) {
+        systemContent += `\n\n${toolInstructions}`;
+      } else {
+        // Create system message with tool instructions if no system prompt exists
+        systemContent = toolInstructions;
       }
-      
-      messages.push({ role: "system", content });
+    }
+    
+    // Add system message if we have content
+    if (systemContent) {
+      messages.push({ role: "system", content: systemContent });
     }
 
     if (req.messages) {

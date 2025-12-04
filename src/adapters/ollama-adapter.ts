@@ -270,6 +270,9 @@ export class OllamaAdapter extends BaseModelAdapter {
     // Clean up extra whitespace
     cleanedBuffer = cleanedBuffer.replace(/\n{3,}/g, '\n\n');
 
+    // Update textBuffer to reflect removed tool calls (critical fix for Bug 1)
+    this.textBuffer = cleanedBuffer;
+
     // Return only new cleaned text (incremental)
     const newCleanedText = cleanedBuffer.slice(this.sentTextLength);
     this.sentTextLength = cleanedBuffer.length;
