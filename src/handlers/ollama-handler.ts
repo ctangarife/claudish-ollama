@@ -137,25 +137,12 @@ export class OllamaCloudHandler implements ModelHandler {
         systemContent = typeof req.system === "string" ? req.system : JSON.stringify(req.system);
       }
       systemContent = this.filterIdentity(systemContent);
-    }
-    
-    // If tools are available, add them to the system context
-    // with instructions to generate tool calls in structured format
-    // (Bug 2 fix: Always add tool instructions, even if no system prompt exists)
-    if (availableTools && availableTools.length > 0) {
-      const toolsDescription = this.formatToolsForContext(availableTools);
-      const toolInstructions = `## Available Tools (Hybrid Execution via Proxy)\n\n${toolsDescription}\n\n**Important**: When you need to use tools, generate them in the JSON format specified above. The proxy will automatically execute them and provide results in the next message.`;
       
-      if (systemContent) {
-        systemContent += `\n\n${toolInstructions}`;
-      } else {
-        // Create system message with tool instructions if no system prompt exists
-        systemContent = toolInstructions;
+      // Add tools context to system message if tools are available
+      if (availableTools && availableTools.length > 0) {
+        systemContent += "\n\n## AVAILABLE TOOLS\n\n" + this.formatToolsForContext(availableTools);
       }
-    }
-    
-    // Add system message if we have content
-    if (systemContent) {
+      
       messages.push({ role: "system", content: systemContent });
     }
 
