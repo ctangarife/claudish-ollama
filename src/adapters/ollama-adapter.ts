@@ -192,6 +192,41 @@ export class OllamaAdapter extends BaseModelAdapter {
       }
     }
 
+    // Pattern 4: Text-based format with markers (e.g., [Tool call: Task (ID: functions.Task:2)]\nInput: {...}<|tool_call_end|>)
+    // This pattern matches: [Tool call: ToolName (ID: ...)]\nInput: {...}<|tool_call_end|>
+    const textFormatPattern = /\[Tool call:\s*([^\s(]+)\s*\(ID:\s*[^)]+\)\]\s*\n\s*Input:\s*(\{[\s\S]*?\})(?:\s*<\|tool_call_end\|>)?(?:\s*<\|tool_calls_section_end\|>)?/g;
+    let textFormatMatch: RegExpExecArray | null;
+    // Reset regex lastIndex to ensure we search from the beginning
+    textFormatPattern.lastIndex = 0;
+    while ((textFormatMatch = textFormatPattern.exec(this.textBuffer)) !== null) {
+      const toolName = textFormatMatch[1].trim();
+      let inputJson = textFormatMatch[2].trim();
+      
+      // Try to extract complete JSON object (handle multiline)
+      // The input might span multiple lines, so we need to find the complete JSON object
+      const inputStart = textFormatMatch.index + textFormatMatch[0].indexOf('Input:') + 6;
+      const jsonBoundaries = this.extractJsonBoundaries(this.textBuffer, inputStart);
+      if (jsonBoundaries) {
+        inputJson = this.textBuffer.slice(jsonBoundaries.start, jsonBoundaries.end);
+      }
+      
+      try {
+        // Try to parse the input JSON
+        const parsedInput = JSON.parse(inputJson);
+        if (typeof parsedInput === 'object' && !Array.isArray(parsedInput)) {
+          // Create a synthetic JSON match for processing
+          allMatches.push({
+            match: textFormatMatch[0],
+            json: JSON.stringify({ tool_call: { name: toolName, input: parsedInput } })
+          });
+          log(`[OllamaAdapter] Detected text-format tool call: ${toolName}`);
+        }
+      } catch (e) {
+        // Invalid JSON in input, skip
+        log(`[OllamaAdapter] Failed to parse input JSON for tool ${toolName}: ${String(e)}`);
+      }
+    }
+
     // If no matches found, check if we have a partial tool call
     if (allMatches.length === 0) {
       // Check if we have a partial tool call JSON

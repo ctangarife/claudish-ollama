@@ -6,7 +6,7 @@ import type { ModelHandler } from "./types.js";
 import { AdapterManager } from "../adapters/adapter-manager.js";
 import type { ToolCall } from "../adapters/base-adapter.js";
 import { MiddlewareManager } from "../middleware/index.js";
-import { transformOpenAIToClaude } from "../transform.js";
+import { transformOpenAIToClaude, removeUriFormat } from "../transform.js";
 import { log, logStructured } from "../logger.js";
 
 const OLLAMA_API_URL = "https://ollama.com/api/chat";
@@ -45,8 +45,8 @@ export class OllamaCloudHandler implements ModelHandler {
   }
 
   // Transform OpenAI request → Ollama
-  private transformToOllamaFormat(openAIPayload: any): any {
-    return {
+  private transformToOllamaFormat(openAIPayload: any, tools?: any[]): any {
+    const payload: any = {
       model: this.normalizeModelName(openAIPayload.model),
       messages: openAIPayload.messages,
       stream: true,
@@ -56,6 +56,13 @@ export class OllamaCloudHandler implements ModelHandler {
         num_predict: openAIPayload.max_tokens
       }
     };
+    
+    // Add tools if available (Ollama Cloud may support native tools)
+    if (tools && tools.length > 0) {
+      payload.tools = tools;
+    }
+    
+    return payload;
   }
 
   private writeTokenFile(input: number, output: number) {
@@ -80,11 +87,12 @@ export class OllamaCloudHandler implements ModelHandler {
     logStructured(`OllamaCloud Request`, { targetModel: target, originalModel: claudePayload.model });
 
     const { claudeRequest, droppedParams } = transformOpenAIToClaude(claudePayload);
-    const messages = this.convertMessages(claudeRequest, claudeRequest.tools);
+    const messages = this.convertMessages(claudeRequest, target);
+    const tools = this.convertTools(claudeRequest);
 
-    // OllamaCloud doesn't natively support tools, but we detect tool calls in JSON format and execute them
-    if (claudeRequest.tools && claudeRequest.tools.length > 0) {
-      log(`[OllamaCloud] Tools context: ${claudeRequest.tools.length} tool(s) documented. Tool execution via JSON parsing is enabled - OllamaCloud should generate tool calls in JSON format.`);
+    // Try native tools first, fallback to JSON parsing if not supported
+    if (tools.length > 0) {
+      log(`[OllamaCloud] Tools: ${tools.length} tool(s) available. Attempting native tool support, with JSON parsing fallback.`);
     }
 
     // Transform to Ollama format
@@ -93,9 +101,9 @@ export class OllamaCloudHandler implements ModelHandler {
       messages: messages,
       temperature: claudeRequest.temperature ?? 1,
       max_tokens: claudeRequest.max_tokens
-    });
+    }, tools);
 
-    await this.middlewareManager.beforeRequest({ modelId: target, messages, tools: [], stream: true });
+    await this.middlewareManager.beforeRequest({ modelId: target, messages, tools, stream: true });
 
     const response = await fetch(OLLAMA_API_URL, {
       method: "POST",
@@ -121,7 +129,7 @@ export class OllamaCloudHandler implements ModelHandler {
     return this.handleStreamingResponse(c, response, adapter, target);
   }
 
-  private convertMessages(req: any, availableTools?: any[]): any[] {
+  private convertMessages(req: any, _modelId: string): any[] {
     const messages: any[] = [];
     let systemContent: string = "";
     
@@ -138,11 +146,6 @@ export class OllamaCloudHandler implements ModelHandler {
       }
       systemContent = this.filterIdentity(systemContent);
       
-      // Add tools context to system message if tools are available
-      if (availableTools && availableTools.length > 0) {
-        systemContent += "\n\n## AVAILABLE TOOLS\n\n" + this.formatToolsForContext(availableTools);
-      }
-      
       messages.push({ role: "system", content: systemContent });
     }
 
@@ -158,18 +161,31 @@ export class OllamaCloudHandler implements ModelHandler {
   private processUserMessage(msg: any, messages: any[]) {
     if (Array.isArray(msg.content)) {
       const textParts: string[] = [];
+      const toolResults: string[] = [];
+      const seen = new Set<string>();
+      
       for (const block of msg.content) {
         if (block.type === "text") {
           textParts.push(block.text || "");
         } else if (block.type === "image") {
           // OllamaCloud doesn't support images in /api/chat, skip or add note
           textParts.push("[Image not supported by OllamaCloud]");
+        } else if (block.type === "tool_result") {
+          // Include tool results in context as text (Ollama may not support role: "tool")
+          if (seen.has(block.tool_use_id)) continue;
+          seen.add(block.tool_use_id);
+          const resultContent = typeof block.content === "string" 
+            ? block.content 
+            : JSON.stringify(block.content);
+          toolResults.push(`Tool result (ID: ${block.tool_use_id}):\n${resultContent}`);
         }
-        // Tool results are not supported by OllamaCloud, skip them
       }
-      // OllamaCloud expects content as a string, not an array
-      const contentString = textParts.filter(Boolean).join("\n\n");
-      if (contentString) {
+      
+      // Combine text and tool results into a single string message
+      const allContent = [...textParts, ...toolResults].filter(Boolean);
+      if (allContent.length > 0) {
+        // OllamaCloud expects content as a string, not an array
+        const contentString = allContent.join("\n\n");
         messages.push({ role: "user", content: contentString });
       }
     } else {
@@ -182,14 +198,24 @@ export class OllamaCloudHandler implements ModelHandler {
   private processAssistantMessage(msg: any, messages: any[]) {
     if (Array.isArray(msg.content)) {
       const strings: string[] = [];
+      const seen = new Set<string>();
+      
       for (const block of msg.content) {
         if (block.type === "text") {
           strings.push(block.text || "");
+        } else if (block.type === "tool_use") {
+          // Include tool calls as text description (Ollama doesn't support native tool_calls)
+          if (seen.has(block.id)) continue;
+          seen.add(block.id);
+          const inputJson = typeof block.input === "string" 
+            ? block.input 
+            : JSON.stringify(block.input);
+          strings.push(`[Tool call: ${block.name} (ID: ${block.id})]\nInput: ${inputJson}`);
         }
-        // Tool calls are not supported by OllamaCloud, skip them
       }
-      // OllamaCloud expects content as a string, not an array
-      const contentString = strings.filter(Boolean).join(" ");
+      
+      // Always send content as string (Ollama requires string, not null or array)
+      const contentString = strings.filter(Boolean).join("\n\n");
       if (contentString) {
         messages.push({ role: "assistant", content: contentString });
       }
@@ -200,59 +226,6 @@ export class OllamaCloudHandler implements ModelHandler {
     }
   }
 
-  private formatToolsForContext(tools: any[]): string {
-    const toolList = tools.slice(0, 30).map((tool: any, idx: number) => {
-      const name = tool.name || "unknown";
-      const desc = tool.description || "No description";
-      const params = tool.input_schema ? JSON.stringify(tool.input_schema.properties || {}, null, 2) : "{}";
-      const required = tool.input_schema?.required || [];
-      return `${idx + 1}. **${name}**: ${desc}\n   Parameters: ${params}\n   Required: ${JSON.stringify(required)}`;
-    }).join("\n\n");
-    
-    const more = tools.length > 30 ? `\n\n... and ${tools.length - 30} more tools available.` : "";
-    
-    // Instructions to generate tool calls in structured JSON format
-    const toolCallInstructions = `
-
-## TOOL CALLING FORMAT (CRITICAL - FOLLOW EXACTLY)
-
-When you need to use a tool, generate ONLY valid JSON. DO NOT mix text with JSON.
-
-**STEP 1: Write your explanation in plain text**
-Example: "I'll create a hello.py file that prints a greeting."
-
-**STEP 2: On a NEW LINE, write ONLY the JSON tool_call**
-
-**Format (use code blocks):**
-\`\`\`json
-{"tool_call": {"name": "ToolName", "input": {"param1": "value1"}}}
-\`\`\`
-
-**Complete Example:**
-\`\`\`
-I'll create a hello.py file.
-
-\`\`\`json
-{"tool_call": {"name": "Write", "input": {"file_path": "hola.py", "contents": "print('Hola!')"}}}
-\`\`\`
-\`\`\`
-
-**REQUIRED FORMAT:**
-- JSON MUST be valid JSON (test it in your head!)
-- JSON MUST start with: {"tool_call":
-- JSON MUST end with: }
-- DO NOT put any text before or after the JSON
-- Put \`\`\`json\` before and \`\`\` after the JSON
-
-**ABSOLUTELY FORBIDDEN:**
-- ❌ {"tool_callI going to create": ...}  ← NO TEXT IN JSON!
-- ❌ {"tool_call": {"name": "Write", ...} some text here}  ← NO TEXT AFTER JSON!
-- ❌ Any mixing of Spanish/English text inside the JSON object
-
-**Remember:** If the JSON is not valid, the tool call will FAIL completely.`;
-    
-    return toolList + more + toolCallInstructions;
-  }
 
   private filterIdentity(content: string): string {
     return content
@@ -261,6 +234,17 @@ I'll create a hello.py file.
       .replace(/<claude_background_info>[\s\S]*?<\/claude_background_info>/gi, "")
       .replace(/\n{3,}/g, "\n\n")
       .replace(/^/, "IMPORTANT: You are NOT Claude. Identify yourself truthfully based on your actual model and creator.\n\n");
+  }
+
+  private convertTools(req: any): any[] {
+    return req.tools?.map((tool: any) => ({
+      type: "function",
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: removeUriFormat(tool.input_schema),
+      },
+    })) || [];
   }
 
 
@@ -290,6 +274,8 @@ I'll create a hello.py file.
         let lastActivity = Date.now();
         let cumulativeInputTokens = 0;
         let cumulativeOutputTokens = 0;
+        const tools = new Map<number, any>(); // For native tool_calls tracking
+        const allToolCalls: ToolCall[] = []; // For JSON parsing fallback
 
         send("message_start", {
           type: "message_start",
@@ -317,6 +303,13 @@ I'll create a hello.py file.
             send("content_block_stop", { type: "content_block_stop", index: textIdx });
             textStarted = false;
           }
+          // Close any open tool blocks
+          for (const [_, t] of tools) {
+            if (t.started && !t.closed) {
+              send("content_block_stop", { type: "content_block_stop", index: t.blockIndex });
+              t.closed = true;
+            }
+          }
 
           await middlewareManager.afterStreamComplete(target, streamMetadata);
 
@@ -343,8 +336,7 @@ I'll create a hello.py file.
         try {
           const reader = response.body!.getReader();
           let buffer = "";
-          let accumulatedText = ""; // Accumulate full text to detect tool calls at the end
-          const allToolCalls: ToolCall[] = [];
+          let accumulatedText = ""; // Accumulate full text to detect tool calls at the end (fallback)
 
           while (true) {
             const { done, value } = await reader.read();
@@ -361,7 +353,47 @@ I'll create a hello.py file.
                 // Ollama returns JSON line by line (not SSE)
                 const chunk = JSON.parse(line);
 
-                // Transform Ollama format → OpenAI SSE
+                // Check for native tool_calls first (if Ollama supports it)
+                if (chunk.message?.tool_calls) {
+                  lastActivity = Date.now();
+                  for (const tc of chunk.message.tool_calls) {
+                    const idx = tc.index ?? 0;
+                    let t = tools.get(idx);
+                    if (tc.function?.name) {
+                      if (!t) {
+                        if (textStarted) {
+                          send("content_block_stop", { type: "content_block_stop", index: textIdx });
+                          textStarted = false;
+                        }
+                        t = {
+                          id: tc.id || `tool_${Date.now()}_${idx}`,
+                          name: tc.function.name,
+                          blockIndex: curIdx++,
+                          started: false,
+                          closed: false
+                        };
+                        tools.set(idx, t);
+                      }
+                      if (!t.started) {
+                        send("content_block_start", {
+                          type: "content_block_start",
+                          index: t.blockIndex,
+                          content_block: { type: "tool_use", id: t.id, name: t.name }
+                        });
+                        t.started = true;
+                      }
+                    }
+                    if (tc.function?.arguments && t) {
+                      send("content_block_delta", {
+                        type: "content_block_delta",
+                        index: t.blockIndex,
+                        delta: { type: "input_json_delta", partial_json: tc.function.arguments }
+                      });
+                    }
+                  }
+                }
+
+                // Transform Ollama format → OpenAI SSE (text content)
                 if (chunk.message?.content) {
                   lastActivity = Date.now();
                   accumulatedText += chunk.message.content;
@@ -376,7 +408,7 @@ I'll create a hello.py file.
                     textStarted = true;
                   }
 
-                  // Process with adapter - the adapter handles buffering and parsing of tool calls
+                  // Process with adapter - the adapter handles buffering and parsing of tool calls (fallback)
                   const res = adapter.processTextContent(chunk.message.content, accumulatedText);
                   
                   // Debug: Log if we detect potential tool calls but can't parse them
@@ -398,10 +430,46 @@ I'll create a hello.py file.
                   }
                   
                   // Accumulate tool calls during streaming, but DO NOT send them until the end
-                  // to ensure the JSON is complete
+                  // to ensure the JSON is complete (fallback method)
                   if (res.extractedToolCalls && res.extractedToolCalls.length > 0) {
                     log(`[OllamaCloud] Detected ${res.extractedToolCalls.length} tool call(s) during streaming - will send at end`);
                     allToolCalls.push(...res.extractedToolCalls);
+                  }
+                }
+
+                // Check for finish_reason indicating tool_calls (native format)
+                if (chunk.message?.stop_reason === "tool_calls" || chunk.done) {
+                  // Close any open native tool blocks
+                  for (const [_, t] of tools) {
+                    if (t.started && !t.closed) {
+                      send("content_block_stop", { type: "content_block_stop", index: t.blockIndex });
+                      t.closed = true;
+                    }
+                  }
+                  
+                  // If we have native tool calls, finalize with tool_use stop reason
+                  if (tools.size > 0 && chunk.message?.stop_reason === "tool_calls") {
+                    await middlewareManager.afterStreamComplete(target, streamMetadata);
+                    send("message_delta", {
+                      type: "message_delta",
+                      delta: { stop_reason: "tool_use", stop_sequence: null },
+                      usage: { output_tokens: cumulativeOutputTokens || 1 }
+                    });
+                    send("message_stop", { type: "message_stop" });
+                    
+                    if (cumulativeInputTokens > 0 || cumulativeOutputTokens > 0) {
+                      handler.writeTokenFile(cumulativeInputTokens, cumulativeOutputTokens);
+                    }
+                    
+                    if (!isClosed) {
+                      try {
+                        controller.enqueue(encoder.encode('data: [DONE]\n\n\n'));
+                      } catch (e) {}
+                      controller.close();
+                      isClosed = true;
+                      if (ping) clearInterval(ping);
+                    }
+                    return;
                   }
                 }
 
@@ -415,13 +483,13 @@ I'll create a hello.py file.
                     cumulativeOutputTokens += chunk.eval_count;
                   }
                   
-                  // Process final text with adapter to detect remaining tool calls
+                  // Process final text with adapter to detect remaining tool calls (fallback)
                   const finalRes = adapter.processTextContent("", accumulatedText);
                   if (finalRes.extractedToolCalls && finalRes.extractedToolCalls.length > 0) {
                     allToolCalls.push(...finalRes.extractedToolCalls);
                   }
                   
-                  // If there are tool calls, send them as tool_use blocks
+                  // If there are tool calls from JSON parsing, send them as tool_use blocks (fallback)
                   if (allToolCalls.length > 0) {
                     log(`[OllamaCloud] ✅ Detected ${allToolCalls.length} tool call(s) in response`);
                     
@@ -433,9 +501,15 @@ I'll create a hello.py file.
                     
                     // Send each tool call as tool_use block
                     for (const toolCall of allToolCalls) {
+                      // Validate tool name
+                      if (!toolCall.name || typeof toolCall.name !== 'string') {
+                        log(`[OllamaCloud] WARNING: Tool call has invalid name, skipping`);
+                        continue;
+                      }
+
                       // Validate arguments
                       if (!toolCall.arguments || typeof toolCall.arguments !== 'object') {
-                        log(`[OllamaCloud] WARNING: Tool ${toolCall.name} has invalid arguments, skipping`);
+                        log(`[OllamaCloud] WARNING: Tool ${toolCall.name} has invalid arguments (type: ${typeof toolCall.arguments}), skipping`);
                         continue;
                       }
 
@@ -443,21 +517,34 @@ I'll create a hello.py file.
                       let inputJson: string;
                       try {
                         inputJson = JSON.stringify(toolCall.arguments);
-                        JSON.parse(inputJson); // Validate JSON is parseable
+                        // Validate JSON is parseable and is a valid object
+                        const parsed = JSON.parse(inputJson);
+                        if (typeof parsed !== 'object' || Array.isArray(parsed)) {
+                          log(`[OllamaCloud] WARNING: Tool ${toolCall.name} arguments must be an object, got: ${Array.isArray(parsed) ? 'array' : typeof parsed}`);
+                          continue;
+                        }
                       } catch (e) {
                         log(`[OllamaCloud] ERROR: Invalid JSON for tool ${toolCall.name}: ${String(e)}`);
                         continue;
                       }
 
+                      // Validate tool call ID format (must be toolu_XXXXX)
+                      let toolId = toolCall.id;
+                      if (!toolId || typeof toolId !== 'string' || !toolId.startsWith('toolu_')) {
+                        // Generate a proper ID if missing or invalid
+                        toolId = `toolu_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 11)}`;
+                        log(`[OllamaCloud] WARNING: Invalid tool ID format (${toolCall.id}), generated new ID: ${toolId}`);
+                      }
+
                       const toolIdx = curIdx++;
-                      log(`[OllamaCloud] Sending tool_use: ${toolCall.name} (id: ${toolCall.id})`);
+                      log(`[OllamaCloud] Sending tool_use: ${toolCall.name} (id: ${toolId}, args: ${inputJson.substring(0, 100)})`);
 
                       send("content_block_start", {
                         type: "content_block_start",
                         index: toolIdx,
                         content_block: {
                           type: "tool_use",
-                          id: toolCall.id,
+                          id: toolId,
                           name: toolCall.name,
                           input: {}
                         }
@@ -533,5 +620,7 @@ I'll create a hello.py file.
 
   async shutdown() {}
 }
+
+
 
 
